@@ -535,10 +535,14 @@ void ProcessExtraction() {
         if (g_bAbortExtraction) break;
 
         uint32_t k1, k2;
-        auto itMap = DTA_MAP.find(filename);
-
+        auto itMap = DTA_MAP.end();
+        std::string upperFilename = ToUpper(filename);
+        for (auto it = DTA_MAP.begin(); it != DTA_MAP.end(); ++it) {
+            if (ToUpper(it->first) == upperFilename) { itMap = it; break; }
+        }
+        
         if (itMap != DTA_MAP.end()) {
-            Log("Processing %s...", filename.c_str());
+            Log("Processing %s (%s)...", filename.c_str(), itMap->second.description);
             k1 = itMap->second.k1;
             k2 = itMap->second.k2;
         }
@@ -816,4 +820,5 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         DispatchMessageA(&msg);
     }
     return 0;
+
 }
