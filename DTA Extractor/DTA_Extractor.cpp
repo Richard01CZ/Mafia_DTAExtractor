@@ -65,8 +65,8 @@ struct FileInfoHeader {
     uint64_t TimeStamp;
     uint32_t FileSize;
     uint32_t BlockCount;
-    uint8_t  NameLength;
-    uint8_t  Flags[7];
+    uint32_t NameLengthFlags;        // NAME_LENGTH_MASK | FLAG_ENCRYPTED, other bits unused
+    uint32_t Unknown3;
 };
 
 struct WavHeader {
@@ -85,6 +85,12 @@ struct WavHeader {
     uint32_t dataSize;
 };
 #pragma pack(pop)
+
+// FileInfoHeader::NameLengthFlags
+const uint32_t NAME_LENGTH_MASK = 0x7FFF;
+const uint32_t FLAG_ENCRYPTED = 0x8000;     // the entry's blocks are encrypted
+// Every block but the last unpacks to exactly this many bytes
+const uint32_t BLOCK_UNPACKED_SIZE = 0x8000;
 
 enum BlockType {
     BLOCK_UNCOMPRESSED = 0,
@@ -232,105 +238,115 @@ void DecryptBlock(void* pBuffer, size_t size, uint32_t k1, uint32_t k2) {
     }
 }
 
-void DecompressLZSS(const std::vector<char>& input, std::vector<char>& output) {
-    size_t pos = 0;
-    size_t len = input.size();
-    const unsigned char* buf = (const unsigned char*)input.data();
+// LZSS/RLE decoder, appended to `out`. `buf` is the block after its type byte.
+// A truncated token or flags word, or a back-reference to before the block's
+// own output, is malformed: no output is guessed, the call fails instead.
+bool DecompressLZSS(const uint8_t* buf, size_t len, std::vector<char>& out) {
+    if (len == 0) return true;
+    if (len < 2) return false;
+
+    const size_t base = out.size();
+    uint16_t flags = (uint16_t)((buf[0] << 8) | buf[1]);
+    int bits = 16;
+    size_t pos = 2;
     while (pos < len) {
-        if (pos + 2 > len) break;
-        uint16_t flags = (buf[pos] << 8) | (buf[pos + 1]);
-        pos += 2;
-        if (flags == 0) {
-            size_t n = 16;
-            if (n > len - pos) n = len - pos;
-            output.insert(output.end(), buf + pos, buf + pos + n);
-            pos += n;
+        if (bits == 0) {
+            // A new flags word must be followed by at least one token
+            if (len - pos < 3) return false;
+            flags = (uint16_t)((buf[pos] << 8) | buf[pos + 1]);
+            bits = 16;
+            pos += 2;
+        }
+
+        if (!(flags & 0x8000)) {
+            out.push_back((char)buf[pos++]);
         }
         else {
-            for (int i = 0; i < 16 && pos < len; ++i) {
-                if (flags & 0x8000) {
-                    if (pos + 2 > len) break;
-                    uint32_t b1 = buf[pos];
-                    uint32_t b2 = buf[pos + 1];
-                    uint32_t offset = (b1 << 4) | (b2 >> 4);
-                    uint32_t n = (b2 & 0x0F);
-                    if (offset == 0) {
-                        if (pos + 4 > len) break;
-                        n = ((n << 8) | buf[pos + 2]) + 16;
-                        char val = (char)buf[pos + 3];
-                        output.insert(output.end(), n, val);
-                        pos += 4;
-                    }
-                    else {
-                        n += 3;
-                        size_t currentSize = output.size();
-                        if (offset > currentSize) {
-                            output.insert(output.end(), n, 0x20);
-                        }
-                        else {
-                            for (size_t j = 0; j < n; ++j) {
-                                output.push_back(output[currentSize - offset + j]);
-                            }
-                        }
-                        pos += 2;
-                    }
-                }
-                else {
-                    output.push_back(buf[pos++]);
-                }
-                flags <<= 1;
+            if (len - pos < 2) return false;
+            uint32_t offset = ((uint32_t)buf[pos] << 4) | (buf[pos + 1] >> 4);
+            if (offset == 0) {
+                // Run: ((low nibble << 8) | next byte) + 16 copies of the 4th byte
+                if (len - pos < 4) return false;
+                size_t n = ((size_t)(buf[pos + 1] & 0x0F) << 8 | buf[pos + 2]) + 16;
+                out.insert(out.end(), n, (char)buf[pos + 3]);
+                pos += 4;
+            }
+            else {
+                // Back-reference: low nibble + 3 bytes from `offset` back, may overlap
+                if (offset > out.size() - base) return false;
+                size_t n = (size_t)(buf[pos + 1] & 0x0F) + 3;
+                size_t from = out.size() - offset;
+                for (size_t j = 0; j < n; ++j) out.push_back(out[from + j]);
+                pos += 2;
             }
         }
+        flags <<= 1;
+        --bits;
     }
+    return true;
+}
+
+// Sound that isn't 16-bit PCM (8-bit PCM, IMA ADPCM, ...) is not DPCM-coded: its
+// payload is a nested block with its own type byte. Type 0 is stored as is,
+// every other type is LZSS. `len` must be > 0.
+bool DecodeNestedBlock(const uint8_t* data, size_t len, std::vector<char>& out) {
+    if (data[0] == BLOCK_UNCOMPRESSED) {
+        out.insert(out.end(), (const char*)data + 1, (const char*)data + len);
+        return true;
+    }
+    return DecompressLZSS(data + 1, len - 1, out);
 }
 
 // -------------------------------------------------------------------------
 // DPCM AUDIO LOGIC
 // -------------------------------------------------------------------------
 
-void DecompressDPCM(
+// 16-bit DPCM decoder, appended to `out`. `channels` is 2 for stereo, 1 otherwise
+// (anything but stereo uses a single predictor). `bufferLen` must be > 0. Fails
+// on a truncated block.
+bool DecompressDPCM(
     int dpcmType,
-    uint8_t* buffer,
+    const uint8_t* buffer,
     size_t bufferLen,
-    std::vector<char>& out,
-    WavHeader& wavHeader,
-    uint32_t k1,
-    uint32_t k2
+    int channels,
+    std::vector<char>& out
 ) {
-    // Safety check for start value
-    if (bufferLen < 2) return;
+    const uint16_t* delta = &WAV_DELTAS[128 * dpcmType];
 
-    // Use uint16_t to match reference behavior (Implicit Overflow Wrapping)
-    uint16_t value = (uint8_t)buffer[0] | ((uint8_t)buffer[1] << 8);
+    // Each block is self-contained: it opens with one raw 16-bit LE sample per
+    // channel (mono: L, stereo: L then R) that seeds the predictors.
+    size_t seedBytes = (size_t)channels * 2;
+    if (bufferLen < seedBytes) return false;
+    // Stereo is decoded in L/R pairs: an odd tail has no right sample
+    if (channels == 2 && (bufferLen - seedBytes) % 2 != 0) return false;
 
-    // Output as standard 16-bit LE (just raw bytes of the uint16)
-    out.push_back((char)(value & 0xFF));
-    out.push_back((char)(value >> 8));
+    uint16_t value[2] = { 0, 0 };
+    for (int c = 0; c < channels; ++c) {
+        // uint16_t: the predictor wraps on overflow
+        value[c] = (uint16_t)((uint8_t)buffer[c * 2] | ((uint8_t)buffer[c * 2 + 1] << 8));
 
-    size_t pos = 2;
-    uint16_t* delta = &WAV_DELTAS[128 * dpcmType];
-
-    if (wavHeader.channels == 1) {
-        while (pos < bufferLen) {
-            // Ref: sign = (b & 0x80) == 0 ? 1.0 : -1.0;
-            // Matches: if bit set -> -1, if clear -> 1
-            int sign = (buffer[pos] & 0x80) ? -1 : 1;
-
-            // Arithmetic on unsigned (wraps on overflow/underflow)
-            value += sign * delta[buffer[pos] & 0x7F];
-
-            out.push_back((char)(value & 0xFF));
-            out.push_back((char)(value >> 8));
-            pos++;
-        }
+        // Output as standard 16-bit LE (just raw bytes of the uint16)
+        out.push_back((char)(value[c] & 0xFF));
+        out.push_back((char)(value[c] >> 8));
     }
-    else {
-        // Fallback for Stereo: Copy raw
-        while (pos < bufferLen) {
-            out.push_back(buffer[pos]);
-            pos++;
-        }
+
+    // Every remaining byte is one delta index, applied to the channels in turn.
+    int ch = 0;
+    for (size_t pos = seedBytes; pos < bufferLen; ++pos) {
+        uint8_t b = buffer[pos];
+
+        // Bit 7 is the sign, the low 7 bits index the delta table
+        int sign = (b & 0x80) ? -1 : 1;
+
+        // Arithmetic on unsigned (wraps on overflow/underflow)
+        value[ch] += sign * delta[b & 0x7F];
+
+        out.push_back((char)(value[ch] & 0xFF));
+        out.push_back((char)(value[ch] >> 8));
+
+        if (channels == 2) ch ^= 1;
     }
+    return true;
 }
 
 // -------------------------------------------------------------------------
@@ -498,6 +514,130 @@ void ShowReportWindow(const std::string& report) {
 // EXTRACTION LOGIC
 // -------------------------------------------------------------------------
 
+// Decodes one archive entry exactly as the game reads it. Returns
+// an empty string on success, otherwise why the entry can't be decoded cleanly;
+// then `data` must not be written. `name` is filled in as soon as it is known.
+std::string DecodeEntry(std::ifstream& file, uint64_t archiveSize, const ContentTableEntry& entry,
+                        uint32_t k1, uint32_t k2, std::string& name, std::vector<char>& data) {
+    name.clear();
+    data.clear();
+    file.clear();
+
+    if ((uint64_t)entry.OffsetToFileInfoHeader + sizeof(FileInfoHeader) > archiveSize)
+        return "file header lies outside the archive";
+    file.seekg(entry.OffsetToFileInfoHeader, std::ios::beg);
+    FileInfoHeader fh;
+    if (!file.read((char*)&fh, sizeof(fh))) return "can't read the file header";
+    DecryptBlock(&fh, sizeof(fh), k1, k2);
+
+    uint32_t nameLen = fh.NameLengthFlags & NAME_LENGTH_MASK;
+    if (nameLen == 0 || nameLen >= MAX_PATH) return "invalid file name length";
+    std::vector<char> nameBuf(nameLen);
+    if (!file.read(nameBuf.data(), nameLen)) return "can't read the file name";
+    DecryptBlock(nameBuf.data(), nameLen, k1, k2);
+    if (memchr(nameBuf.data(), 0, nameLen)) return "file name contains a NUL byte";
+    name.assign(nameBuf.data(), nameLen);
+
+    const bool encrypted = (fh.NameLengthFlags & FLAG_ENCRYPTED) != 0;
+
+    // A byte's block is its offset / BLOCK_UNPACKED_SIZE, and even an empty entry
+    // has one block
+    uint64_t expectedBlocks = fh.FileSize == 0 ? 1 : ((uint64_t)fh.FileSize + BLOCK_UNPACKED_SIZE - 1) / BLOCK_UNPACKED_SIZE;
+    if (fh.BlockCount != expectedBlocks) return "block count doesn't match the declared size";
+    if (entry.OffsetToData >= archiveSize) return "data lies outside the archive";
+    file.seekg(entry.OffsetToData, std::ios::beg);
+
+    data.reserve(std::min<uint32_t>(fh.FileSize, 16 * 1024 * 1024));
+    WavHeader wavHeader{};
+    bool haveWavHeader = false;
+    std::vector<uint8_t> blk;
+
+    for (uint32_t b = 0; b < fh.BlockCount; ++b) {
+        // Low word: this block's stored size, high word: the previous block's
+        uint32_t sizes;
+        if (!file.read((char*)&sizes, 4)) return "can't read a block header";
+        uint32_t bSz = sizes & 0xFFFF;
+        if (bSz == 0) return "empty block";
+        blk.resize(bSz);
+        if (!file.read((char*)blk.data(), bSz)) return "block runs past the end of the archive";
+        if (encrypted) DecryptBlock(blk.data(), bSz, k1, k2);
+
+        const uint8_t type = blk[0];
+        const uint8_t* payload = blk.data() + 1;
+        size_t payloadLen = bSz - 1;
+
+        if (type == BLOCK_LZSS_RLE) {
+            if (!DecompressLZSS(payload, payloadLen, data)) return "malformed LZSS block";
+        }
+        else if (type >= BLOCK_DPCM0) {
+            // Every type from 8 up is a sound block. Block 0 opens with the WAV
+            // header, which decides how all blocks decode.
+            if (b == 0) {
+                if (payloadLen < sizeof(WavHeader)) return "sound block too short for its WAV header";
+                memcpy(&wavHeader, payload, sizeof(WavHeader));
+                // A plain entry still stores its header encrypted, keyed from the
+                // header's first byte. In an encrypted entry the header was
+                // decrypted with the rest of the block above, so a second pass
+                // would scramble it.
+                if (!encrypted) DecryptBlock(&wavHeader, sizeof(WavHeader), k1, k2);
+                if (memcmp(wavHeader.riff, "RIFF", 4) != 0) return "WAV header doesn't decrypt to RIFF";
+                if (wavHeader.channels == 0) return "WAV header has no channels";
+                haveWavHeader = true;
+                data.insert(data.end(), (const char*)&wavHeader, (const char*)&wavHeader + sizeof(WavHeader));
+                payload += sizeof(WavHeader);
+                payloadLen -= sizeof(WavHeader);
+            }
+            else if (!haveWavHeader) {
+                return "sound block in an entry that doesn't start with a WAV header";
+            }
+
+            if (payloadLen > 0) {
+                // Only 16-bit samples (blockAlign / channels == 2) are DPCM-coded.
+                // Anything else, e.g. 8-bit PCM or IMA ADPCM, nests an ordinary block.
+                if (wavHeader.blockAlign / wavHeader.channels == 2) {
+                    // 12, 16, ..., 32 pick DPCM tables 1-6; any other type uses table 0
+                    int dpcmType = 0;
+                    if (type <= BLOCK_DPCM6 && type % 4 == 0)
+                        dpcmType = (type - BLOCK_DPCM0) / 4;
+                    if (!DecompressDPCM(dpcmType, payload, payloadLen, wavHeader.channels == 2 ? 2 : 1, data))
+                        return "malformed DPCM block";
+                }
+                else if (!DecodeNestedBlock(payload, payloadLen, data)) {
+                    return "malformed nested block in a sound block";
+                }
+            }
+        }
+        else {
+            // Types 0 and 2-7 are stored as is
+            data.insert(data.end(), (const char*)payload, (const char*)payload + payloadLen);
+        }
+
+        if (data.size() > fh.FileSize) return "unpacks past the declared size";
+    }
+
+    // The archive records the exact unpacked size
+    if (data.size() != fh.FileSize) {
+        char reason[96];
+        sprintf_s(reason, sizeof(reason), "unpacked to %u bytes, archive declares %u", (unsigned)data.size(), fh.FileSize);
+        return reason;
+    }
+    return "";
+}
+
+// Writes one extracted file. A partly written file is deleted, never left behind.
+std::string WriteOutputFile(const std::string& name, const std::vector<char>& data) {
+    CreatePathRecursively(name);
+    std::ofstream out(name, std::ios::binary | std::ios::trunc);
+    if (!out.is_open()) return "can't create the output file";
+    if (!data.empty()) out.write(data.data(), data.size());
+    out.close();
+    if (out.fail()) {
+        DeleteFileA(name.c_str());
+        return "writing the output file failed";
+    }
+    return "";
+}
+
 void ProcessExtraction() {
     g_bAbortExtraction = false;
     int count = (int)SendMessageA(hList, LB_GETSELCOUNT, 0, 0);
@@ -534,14 +674,14 @@ void ProcessExtraction() {
     for (const auto& filename : filesToProcess) {
         if (g_bAbortExtraction) break;
 
-        uint32_t k1, k2;
         auto itMap = DTA_MAP.end();
         std::string upperFilename = ToUpper(filename);
         for (auto it = DTA_MAP.begin(); it != DTA_MAP.end(); ++it) {
             if (ToUpper(it->first) == upperFilename) { itMap = it; break; }
         }
-        
-        if (itMap != DTA_MAP.end()) {
+        uint32_t k1, k2;
+        const bool usedDefaults = (itMap == DTA_MAP.end());
+        if (!usedDefaults) {
             Log("Processing %s (%s)...", filename.c_str(), itMap->second.description);
             k1 = itMap->second.k1;
             k2 = itMap->second.k2;
@@ -555,165 +695,82 @@ void ProcessExtraction() {
         std::ifstream file(filename, std::ios::binary | std::ios::ate);
         if (!file.is_open()) { report += filename + ": FAILED (File not found)\r\n"; continue; }
 
-        std::streamsize fileSize = file.tellg();
+        const uint64_t archiveSize = (uint64_t)file.tellg();
         file.seekg(0, std::ios::beg);
 
-        char magic[5] = { 0 };
-        file.read(magic, 4);
-        if (strcmp(magic, "ISD0") != 0) { report += filename + ": FAILED (Invalid Magic)\r\n"; continue; }
+        char magic[4];
+        if (!file.read(magic, 4) || memcmp(magic, "ISD0", 4) != 0) {
+            report += filename + ": FAILED (Invalid Magic)\r\n";
+            continue;
+        }
 
         DTAHeader header;
-        file.read((char*)&header, sizeof(header));
+        if (!file.read((char*)&header, sizeof(header))) {
+            report += filename + ": FAILED (Truncated archive header)\r\n";
+            continue;
+        }
         DecryptBlock(&header, sizeof(header), k1, k2);
 
-        if (header.FileCount > 100000 || header.OffsetToContentTable > (uint32_t)fileSize) {
-            report += filename + ": FAILED (Decryption failed/Bad Keys)\r\n";
+        // The table holds exactly FileCount entries and lies inside the archive.
+        // A wrong key or a damaged header can't satisfy both.
+        if ((uint64_t)header.FileCount * sizeof(ContentTableEntry) != header.SizeOfContentTable ||
+            (uint64_t)header.OffsetToContentTable + header.SizeOfContentTable > archiveSize) {
+            report += filename + ": FAILED (Bad keys or damaged archive header)\r\n";
             continue;
         }
 
         std::vector<ContentTableEntry> table(header.FileCount);
         file.seekg(header.OffsetToContentTable, std::ios::beg);
-        file.read((char*)table.data(), header.FileCount * sizeof(ContentTableEntry));
-        DecryptBlock(table.data(), table.size() * sizeof(ContentTableEntry), k1, k2);
+        if (header.FileCount > 0 && !file.read((char*)table.data(), header.SizeOfContentTable)) {
+            report += filename + ": FAILED (Can't read the file table)\r\n";
+            continue;
+        }
+        DecryptBlock(table.data(), header.SizeOfContentTable, k1, k2);
 
         SendMessageA(hProgress, PBM_SETRANGE, 0, MAKELPARAM(0, header.FileCount));
         int extracted = 0;
+        std::vector<std::string> failures;
+        std::string name;
+        std::vector<char> data;
 
         for (uint32_t f = 0; f < header.FileCount; ++f) {
             if (f % 20 == 0 && !CheckProcessMessages()) break;
 
-            file.seekg(table[f].OffsetToFileInfoHeader, std::ios::beg);
-            FileInfoHeader fh;
-            file.read((char*)&fh, sizeof(fh));
-            DecryptBlock(&fh, sizeof(fh), k1, k2);
-
-            if (fh.NameLength == 0 || fh.NameLength > 255) continue;
-
-            std::vector<char> nameBuf(fh.NameLength + 1, 0);
-            file.read(nameBuf.data(), fh.NameLength);
-            DecryptBlock(nameBuf.data(), fh.NameLength, k1, k2);
-            std::string internalName = nameBuf.data();
-
-            // USE DATA OFFSET FROM TABLE
-            uint32_t dataStart = table[f].OffsetToData;
-            file.seekg(dataStart, std::ios::beg);
-
-            std::vector<char> finalData;
-            finalData.reserve(fh.FileSize);
-
-            // Persistent state for current file
-            bool wavHeaderRead = false;
-            WavHeader wavHeader{};
-
-            for (uint32_t b = 0; b < fh.BlockCount; ++b) {
-                uint32_t bSz;
-                file.read((char*)&bSz, 4);
-                bSz &= 0xFFFF;
-
-                if (bSz == 0) continue;
-
-                std::vector<char> blk(bSz);
-                file.read(blk.data(), bSz);
-
-                // Check Encryption Flag: mFlags[0] is bit 0x80
-                if (fh.Flags[0] & 0x80) DecryptBlock(blk.data(), bSz, k1, k2);
-
-                uint8_t blockType = (uint8_t)blk[0];
-
-                if (blockType == BLOCK_UNCOMPRESSED) {
-                    finalData.insert(finalData.end(), blk.begin() + 1, blk.end());
-
-                    // If file started with a raw block (not DPCM), check if it was a header
-                    if (!wavHeaderRead && finalData.size() >= sizeof(WavHeader)) {
-                        memcpy(&wavHeader, finalData.data(), sizeof(WavHeader));
-                        if (memcmp(wavHeader.riff, "RIFF", 4) == 0) {
-                            wavHeaderRead = true;
-                        }
-                    }
-                }
-                else if (blockType == BLOCK_LZSS_RLE) {
-                    std::vector<char> tmp;
-                    DecompressLZSS(
-                        std::vector<char>(blk.begin() + 1, blk.end()),
-                        tmp
-                    );
-                    finalData.insert(finalData.end(), tmp.begin(), tmp.end());
-                }
-                // Updated Logic: Check range 8 to 32
-                else if (blockType >= BLOCK_DPCM0 && blockType <= BLOCK_DPCM6) {
-                    int dpcmType = (blockType - 8) / 4;
-
-                    // Header Decryption Logic
-                    if (!wavHeaderRead) {
-                        if (blk.size() > 1 + sizeof(WavHeader)) {
-                            memcpy(&wavHeader, blk.data() + 1, sizeof(WavHeader));
-                            // DOUBLE DECRYPT HEADER
-                            DecryptBlock(&wavHeader, sizeof(WavHeader), k1, k2);
-
-                            // Validate
-                            if (memcmp(wavHeader.riff, "RIFF", 4) != 0) {
-                                // Fallback Synth
-                                memset(&wavHeader, 0, sizeof(WavHeader));
-                                memcpy(wavHeader.riff, "RIFF", 4);
-                                memcpy(wavHeader.wave, "WAVE", 4);
-                                memcpy(wavHeader.fmt, "fmt ", 4);
-                                wavHeader.fmtSize = 16;
-                                wavHeader.format = 1;
-                                wavHeader.channels = 1;
-                                wavHeader.sampleRate = 44100;
-                                wavHeader.bitsPerSample = 16;
-                                wavHeader.blockAlign = 2;
-                                wavHeader.byteRate = 44100 * 2;
-                                memcpy(wavHeader.data, "data", 4);
-                            }
-
-                            wavHeaderRead = true;
-                            finalData.insert(finalData.end(), (char*)&wavHeader, (char*)&wavHeader + sizeof(WavHeader));
-
-                            // Pass REST of data to decompressor (Skip Type + Header)
-                            DecompressDPCM(
-                                dpcmType,
-                                (uint8_t*)blk.data() + 1 + sizeof(WavHeader),
-                                blk.size() - 1 - sizeof(WavHeader),
-                                finalData,
-                                wavHeader,
-                                k1, k2
-                            );
-                        }
-                    }
-                    else {
-                        // Header already read, just decompress data (Skip Type)
-                        DecompressDPCM(
-                            dpcmType,
-                            (uint8_t*)blk.data() + 1,
-                            blk.size() - 1,
-                            finalData,
-                            wavHeader,
-                            k1, k2
-                        );
-                    }
-                }
-                else {
-                    // Unknown blocks
-                    if (blk.size() > 1) {
-                        finalData.insert(finalData.end(), blk.begin() + 1, blk.end());
-                    }
-                }
-            }
-
-            CreatePathRecursively(internalName);
-            std::ofstream out(internalName, std::ios::binary);
-            if (out.is_open()) {
-                out.write(finalData.data(), finalData.size());
+            // A file that can't be decoded exactly as the game reads it is not
+            // written at all, only reported
+            std::string err = DecodeEntry(file, archiveSize, table[f], k1, k2, name, data);
+            if (err.empty()) err = WriteOutputFile(name, data);
+            if (err.empty()) {
                 extracted++;
+            }
+            else {
+                if (name.empty()) {
+                    char entryName[32];
+                    sprintf_s(entryName, sizeof(entryName), "entry #%u", f);
+                    name = entryName;
+                }
+                failures.push_back(name + ": " + err);
             }
             SendMessageA(hProgress, PBM_SETPOS, f, 0);
         }
 
-        char sum[128];
-        const char* statusPrefix = (itMap == DTA_MAP.end()) ? ": SUCCESS (Used Defaults - " : ": SUCCESS (";
-        sprintf_s(sum, 128, "%s%d files)\r\n", statusPrefix, extracted);
-        report += filename + sum;
+        char sum[160];
+        if (failures.empty()) {
+            const char* statusPrefix = usedDefaults ? ": SUCCESS (Used Defaults - " : ": SUCCESS (";
+            sprintf_s(sum, sizeof(sum), "%s%d files)\r\n", statusPrefix, extracted);
+            report += filename + sum;
+        }
+        else {
+            sprintf_s(sum, sizeof(sum), ": %d files extracted%s, %d FAILED (not written):\r\n",
+                      extracted, usedDefaults ? " (Used Defaults)" : "", (int)failures.size());
+            report += filename + sum;
+            const size_t shown = std::min<size_t>(failures.size(), 50);
+            for (size_t i = 0; i < shown; ++i) report += "  " + failures[i] + "\r\n";
+            if (failures.size() > shown) {
+                sprintf_s(sum, sizeof(sum), "  ... and %d more\r\n", (int)(failures.size() - shown));
+                report += sum;
+            }
+        }
     }
 
     EnableWindow(hBtnExtract, TRUE); EnableWindow(hBtnSelectAll, TRUE); EnableWindow(hBtnPatch, TRUE);
@@ -820,5 +877,4 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         DispatchMessageA(&msg);
     }
     return 0;
-
 }
